@@ -20,7 +20,12 @@ _NOT_FOUND = -704
 
 
 class AuxObjectStoreFullError(BlockObjectStoreError):
-    """The store had no memory for the objects; a later write may fit."""
+    """The store had no memory for the objects; a later write may fit. The
+    first `num_written` objects were written."""
+
+    def __init__(self, message: str, num_written: int = 0) -> None:
+        super().__init__(message)
+        self.num_written = num_written
 
 
 class MooncakeAuxObjectStore:
@@ -70,18 +75,21 @@ class MooncakeAuxObjectStore:
         return cls(store, replicate_config)
 
     def put_batch(self, keys: Sequence[str], values: Sequence[bytes]) -> None:
-        """Write every object, or raise `BlockObjectStoreError`, which is
-        `AuxObjectStoreFullError` if the store has no memory for them."""
-        code = self._store.put_batch(list(keys), list(values), self._replicate_config)
-        if not code:
-            return
-        error = (
-            AuxObjectStoreFullError if code == _PUT_NO_MEMORY else BlockObjectStoreError
-        )
-        raise error(
-            f"Mooncake failed to write {len(keys)} auxiliary-output "
-            f"objects from {keys[0]!r}: {code}"
-        )
+        """Write the objects in order, or raise `BlockObjectStoreError`, which
+        is `AuxObjectStoreFullError` if the store has no memory for one of
+        them. A Mooncake batch the store refuses can still have written some
+        of its objects, so each object is put on its own."""
+        for index, (key, value) in enumerate(zip(keys, values, strict=True)):
+            code = self._store.put_batch([key], [value], self._replicate_config)
+            if code == _PUT_NO_MEMORY:
+                raise AuxObjectStoreFullError(
+                    f"Mooncake has no memory for auxiliary-output object {key!r}",
+                    index,
+                )
+            if code:
+                raise BlockObjectStoreError(
+                    f"Mooncake failed to write auxiliary-output object {key!r}: {code}"
+                )
 
     def remove(self, keys: Sequence[str]) -> list[int]:
         """Remove the objects `keys`, even if read under a lease; one

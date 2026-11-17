@@ -183,7 +183,8 @@ _PUT_RETRY_INTERVAL_S = 0.2
 class SessionObjectWriter:
     """Write the objects of session requests in the background, one array per
     output field. A put the store refuses for lack of memory is retried every
-    `_PUT_RETRY_INTERVAL_S`, and queuing and draining wait while it is. Once
+    `_PUT_RETRY_INTERVAL_S`, without the objects already written, and
+    queuing and draining wait while it is. Once
     writes have been pending for `put_stall_timeout_s` without a successful
     put, or a put fails otherwise, `check` raises from then on and later
     writes are dropped."""
@@ -240,6 +241,10 @@ class SessionObjectWriter:
             try:
                 self._store.put_batch(keys, values)
             except AuxObjectStoreFullError as error:
+                if error.num_written:
+                    keys = keys[error.num_written :]
+                    values = values[error.num_written :]
+                    self._last_progress = time.monotonic()
                 if self._stalled() or self._closed.wait(_PUT_RETRY_INTERVAL_S):
                     raise BlockObjectStoreError(
                         "auxiliary output objects were not written in time"
