@@ -21,8 +21,10 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
 )
 from vllm.distributed.aux_output_connector.object_store import (
+    AuxSampleKeys,
     aux_session_pattern,
     read_aux_rows,
+    release_aux_keys,
 )
 from vllm.distributed.aux_output_connector.session_objects import (
     SessionObjectWriter,
@@ -1087,9 +1089,11 @@ class SessionEngine:
                 before_step()
         return outputs
 
-    def close(self, stale_names=False):
-        if not self.scheduler.has_unfinished_requests():
+    def close(self, stale_names=False, check_leaks=True):
+        finished = not self.scheduler.has_unfinished_requests()
+        if finished:
             self.run()
+            self.pause()
         self.worker.close()
         size = self.block_size
         step = size // self.hash_block_size
@@ -1112,19 +1116,16 @@ class SessionEngine:
             rows = read_aux_rows(self.store, keys, "routed_experts", timeout_s=0)
             assert rows[:, 0, 0].tolist() == list(range(request.num_tokens - 1))
             row_versions = rows[:, 0, 1].tolist()
-            segments = self.segments[request_id]
-            stated = [
-                int(version[1:])
-                for (start, version), (end, _) in zip(segments, segments[1:])
-                for _ in range(start, end)
-            ]
-            if not stale_names:
-                assert row_versions[: len(stated)] == stated
             for index, key in enumerate(keys):
                 end = None if "/tail/" in key else (index + 1) * size
                 block = slice(index * size, end)
                 if writes[key] == 1 or not stale_names:
                     assert row_versions[block] == versions[block]
+        if finished and check_leaks:
+            assert self.client.objects.keys() <= self.listed()
+
+    def listed(self):
+        return {key for _, keys, _ in self._stopped for key in keys}
 
 
 def _session_requests(
@@ -1150,6 +1151,7 @@ def _session_requests(
     )
     params.update_from_generation_config({}, EOS_TOKEN_ID)
     salted = SimpleNamespace(
+        request_id=request_ids[0],
         sampling_params=params,
         prompt_token_ids=[token] * num_tokens,
         prompt_embeds=None,
@@ -1227,20 +1229,17 @@ def test_session_keys_resolve_to_the_rows_of_the_kv_each_request_used(
 
 
 @pytest.mark.parametrize("sliding_window", [None, 32], ids=["one-group", "two-groups"])
-def test_session_siblings_admitted_in_one_step_share_the_prompt(sliding_window):
+def test_session_siblings_share_no_objects(sliding_window):
     engine = _tier_engine(sliding_window=sliding_window)
-    scheduler = engine.scheduler
     for request in _session_requests(["first", "second"], 40, 1):
-        scheduler.add_request(request)
-    scheduler_output = engine.schedule()
-    assert scheduler_output.num_scheduled_tokens == {"first": 40, "second": 8}
-    engine.step(scheduler_output, {"first": [1], "second": [2]})
+        engine.scheduler.add_request(request)
+    engine.run()
     engine.close()
-    assert engine.keys["first"] == engine.keys["second"] and len(engine.keys) == 2
-    assert len(engine.keys["first"]) == 3
+    first, second = engine.keys["first"], engine.keys["second"]
+    assert len(first) == len(second) == 3 and not set(first) & set(second)
 
 
-def test_session_hits_the_blocks_of_a_request_aborted_before_its_output():
+def test_session_request_aborted_before_its_output_leaves_no_objects():
     scheduler = create_scheduler(enable_prefix_caching=True)
     engine = SessionEngine(scheduler)
     first, second = _session_requests(["first", "second"], 40, 1)
@@ -1251,10 +1250,11 @@ def test_session_hits_the_blocks_of_a_request_aborted_before_its_output():
 
     scheduler.add_request(second)
     scheduler_output = engine.schedule()
-    assert scheduler_output.num_scheduled_tokens == {"second": 8}
+    assert scheduler_output.num_scheduled_tokens == {"second": 40}
     engine.step(scheduler_output, {"second": [2]})
     engine.close()
-    assert "first" not in engine.keys and len(engine.keys["second"]) == 3
+    assert "first" not in engine.keys and engine.client.removes
+    assert set(engine.client.objects) == set(engine.keys["second"])
 
 
 def test_preempted_session_request_that_stops_on_its_output_in_flight():
@@ -1490,10 +1490,10 @@ class HashStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
 @pytest.mark.parametrize(
     "session,expected",
-    [("s", 8), ("t", 40), (None, 40)],
+    [("s", 40), ("t", 40), (None, 40)],
     ids=["same-session", "other-session", "no-session"],
 )
-def test_only_requests_of_a_session_hit_its_blocks(session, expected):
+def test_session_request_hits_no_blocks_of_another_request(session, expected):
     engine = SessionEngine(create_scheduler(enable_prefix_caching=True))
     _run_turn(engine, 0, "first")
     (second,) = _session_requests(["second"], 40, 1, session=session)
@@ -1586,7 +1586,7 @@ def test_session_response_segments_end_at_the_last_computed_hash_block(max_token
     engine = _tier_engine()
     _run_turn(engine, 1, "first", 40, max_tokens)
     engine.close()
-    assert engine.segments["first"] == [(0, "v1"), (end, None)]
+    assert engine.segments["first"] == [(0, "first@v1"), (end, None)]
 
 
 def test_session_tails_at_other_versions_have_other_keys():
@@ -1605,7 +1605,7 @@ def test_session_turn_computes_again_the_block_hashed_when_its_request_stopped()
     _run_turn(engine, 2, "second", 72, segments=segments, lookahead=1)
     engine.close()
     first, second = engine.keys["first"], engine.keys["second"]
-    assert segments == [(0, "v1"), (32, None)]
+    assert segments == [(0, "first@v1"), (32, None)]
     assert second[:2] == first[:2] and "/tail/" in first[2] and second[2] != first[2]
 
 
@@ -1643,7 +1643,7 @@ def test_session_request_running_at_a_prefix_cache_reset_resumes(
     )
     engine.run()
     engine.close()
-    assert engine.segments["r"] == [(0, "v1"), (32, None)]
+    assert engine.segments["r"] == [(0, "r@v1"), (32, None)]
 
 
 def test_session_request_resumed_after_a_reset_sends_hashes_from_its_hit():
@@ -1705,16 +1705,34 @@ def test_reset_writes_the_objects_its_preempted_session_request_completed(fields
     engine.close()
 
 
-def test_session_release_removes_every_object_of_the_session():
+def test_released_samples_leave_no_objects():
     engine = _tier_engine(connector=None)
-    _run_turn(engine, 0, "first", 48, lookahead=1)
-    _run_turn(engine, 0, "other", 48, lookahead=1, session="s2")
+    _run_turn(engine, 1, "turn1", 48, lookahead=1)
+    _run_turn(engine, 2, "turn2", 80, segments=engine.segments["turn1"])
+    _run_turn(engine, 2, "parent", 40, token=1)
+    for child in ("child1", "child2"):
+        _run_turn(engine, 3, child, 72, token=1, segments=engine.segments["parent"])
     engine.close()
-    listed = {key for keys in engine.keys.values() for key in keys}
-    assert set(engine.client.objects) - listed
-    engine.client.remove_by_regex(aux_session_pattern("job", "s"), True)
-    assert engine.client.objects
-    assert all(key.startswith("job/s2/") for key in engine.client.objects)
+    sample = AuxSampleKeys()
+    sample.add(engine.keys["turn1"])
+    sample.add(engine.keys["turn2"])
+    group = AuxSampleKeys()
+    group.add(engine.keys["parent"])
+    children = []
+    for child in ("child1", "child2"):
+        keys = AuxSampleKeys(group)
+        keys.add(engine.keys[child])
+        children.append(keys)
+    assert set(engine.keys["parent"][:2]) <= set(engine.keys["child1"])
+    owned = [sample.owned, group.owned] + [keys.owned for keys in children]
+    assert (
+        sum(map(len, owned)) == len(set().union(*owned)) == len(engine.client.objects)
+    )
+    for keys in [sample.owned] + [keys.owned for keys in children]:
+        assert release_aux_keys(engine.store, keys, timeout_s=0) == []
+    assert set(engine.client.objects) == set(group.owned)
+    assert release_aux_keys(engine.store, group.owned, timeout_s=0) == []
+    assert not engine.client.objects
 
 
 def test_pause_writes_every_object_of_the_stopped_session_requests():
@@ -1783,7 +1801,7 @@ def test_session_request_preempted_by_a_failed_pause_reset_resumes():
     core.resume_scheduler()
     engine.run()
     engine.close()
-    assert engine.segments["r"] == [(0, "v1"), (32, None)]
+    assert engine.segments["r"] == [(0, "r@v1"), (32, None)]
 
 
 def test_session_key_of_a_block_whose_hash_follows_the_stop_is_a_tail():
@@ -1793,7 +1811,7 @@ def test_session_key_of_a_block_whose_hash_follows_the_stop_is_a_tail():
     engine.close()
     first, second = engine.keys["first"], engine.keys["second"]
     assert len(first) == 3 and first[:2] == second[:2] and "/tail/" in first[2]
-    assert len(engine.client.payloads[second[2]]) == 2
+    assert second[2] not in first and engine.client.removes
 
 
 def _preempt_at_an_object_boundary(engine, versions):
@@ -1838,7 +1856,7 @@ def test_weight_update_names_the_rest_of_a_running_prefill_by_the_new_version(
     engine.set_version(2)
     engine.run()
     engine.close()
-    assert engine.segments["r"] == [(0, "v1"), (chunk, "v2"), (64, None)]
+    assert engine.segments["r"] == [(0, "r@v1"), (chunk, "r@v2"), (64, None)]
 
 
 def test_weight_update_names_a_block_after_rejected_drafts_by_the_new_version():
@@ -1861,7 +1879,7 @@ def test_weight_update_names_a_block_after_rejected_drafts_by_the_new_version():
     while not request.is_finished():
         engine.step(engine.schedule(), {"r": [0]})
     engine.close()
-    assert engine.segments["r"][:2] == [(0, "v1"), (computed, "v2")]
+    assert engine.segments["r"][:2] == [(0, "r@v1"), (computed, "r@v2")]
 
 
 def test_preempted_session_request_salts_the_object_it_computes_again():
@@ -1869,14 +1887,14 @@ def test_preempted_session_request_salts_the_object_it_computes_again():
     request, _ = _preempt_at_an_object_boundary(engine, (1, 1, 1) + (2,) * 13)
     engine.run()
     engine.close()
-    assert engine.segments["r"] == [(0, "v1"), (16, "v2"), (32, None)]
+    assert engine.segments["r"] == [(0, "r@v1"), (16, "r@v2"), (32, None)]
     fresh = Request(
         request_id="fresh",
         prompt_token_ids=list(request.all_token_ids),
         sampling_params=request.sampling_params,
         pooling_params=None,
         cache_salt=request.cache_salt,
-        cache_salt_segments=[(0, "v1"), (16, "v2")],
+        cache_salt_segments=[(0, "r@v1"), (16, "r@v2")],
         block_hasher=get_request_block_hasher(4, sha256),
     )
     assert fresh.block_hashes == request.block_hashes
@@ -1894,7 +1912,7 @@ def test_session_request_preempted_by_a_reset_takes_the_next_version():
     engine.run()
     engine.close()
     assert engine.num_loads > 0
-    assert engine.segments["r"] == [(0, "v1"), (16, "v2"), (32, None)]
+    assert engine.segments["r"] == [(0, "r@v1"), (16, "r@v2"), (32, None)]
 
 
 def test_preempted_session_request_keeps_its_hashes_at_the_same_version():
@@ -1906,7 +1924,7 @@ def test_preempted_session_request_keeps_its_hashes_at_the_same_version():
     assert all(a is b for a, b in zip(hashes, resumed, strict=True))
 
 
-def test_session_request_is_rehashed_from_its_first_salt_of_another_version():
+def test_session_request_without_the_kv_of_its_segments_names_them_again():
     engine = _tier_engine(connector=None)
     engine.set_version(2)
     (request,) = _session_requests(
@@ -1916,10 +1934,8 @@ def test_session_request_is_rehashed_from_its_first_salt_of_another_version():
     hashes = list(request.block_hashes)
     engine.run()
     engine.close()
-    kept = request.block_hashes[:2]
-    assert all(a is b for a, b in zip(hashes[:2], kept, strict=True))
-    assert hashes[2] != request.block_hashes[2]
-    assert engine.segments["r"] == [(0, "v2"), (64, None)]
+    assert not set(hashes) & set(request.block_hashes)
+    assert engine.segments["r"] == [(0, "r@v2"), (64, None)]
 
 
 def test_preempted_session_request_offloads_under_its_new_hashes():
@@ -1962,7 +1978,7 @@ def test_rejected_weight_version_keeps_the_current_one(live, version):
     assert request.cache_salt_segments == segments
     (other,) = _session_requests(["other"], 40, 4)
     engine.scheduler.add_request(other)
-    assert other.cache_salt_segments == [(0, "v1")]
+    assert other.cache_salt_segments == [(0, "other@v1")]
     engine.close()
 
 
@@ -1979,7 +1995,7 @@ def test_session_response_segments_end_at_positions_no_step_in_flight_computes()
     outputs = engine.step(first_decode, {"r": [7]})
     engine.step(second_decode, {"r": [1]})
     engine.close()
-    assert outputs["r"].aux_version_segments == [(0, "v0"), (32, None)]
+    assert outputs["r"].aux_version_segments == [(0, "r@v0"), (32, None)]
 
 
 def test_session_external_hit_inside_a_kv_block_is_refused():
@@ -2003,8 +2019,12 @@ def test_session_segments_end_on_objects_when_hash_blocks_are_smaller():
     _run_turn(engine, 3, "second", 72, segments=segments, hash_block_size=4)
     engine.close()
     second = engine.requests["second"]
-    assert segments == [(0, "v1"), (41, "v2"), (48, None)]
-    assert second.cache_salt_segments == [(0, "v1"), (41, "v2"), (48, "v3")]
+    assert segments == [(0, "first@v1"), (41, "first@v2"), (48, None)]
+    assert second.cache_salt_segments == [
+        (0, "first@v1"),
+        (41, "first@v2"),
+        (48, "second@v3"),
+    ]
     assert engine.keys["second"][:3] == engine.keys["first"][:3]
     fresh = Request(
         request_id="fresh",
@@ -2012,7 +2032,7 @@ def test_session_segments_end_on_objects_when_hash_blocks_are_smaller():
         sampling_params=second.sampling_params,
         pooling_params=None,
         cache_salt=second.cache_salt,
-        cache_salt_segments=[(0, "v1"), (41, "v2"), (48, "v3")],
+        cache_salt_segments=[(0, "first@v1"), (41, "first@v2"), (48, "second@v3")],
         block_hasher=get_request_block_hasher(4, sha256),
     )
     assert fresh.block_hashes == second.block_hashes
@@ -2025,20 +2045,20 @@ def test_session_admission_rounds_client_segments_down_to_an_object():
         ["r"], 46, 1, segments=[(0, "v1"), (48, None)], hash_block_size=4
     )
     engine.scheduler.add_request(request)
-    assert request.cache_salt_segments == [(0, "v1"), (32, "v2")]
+    assert request.cache_salt_segments == [(0, "v1"), (32, "r@v2")]
     fresh = Request(
         request_id="fresh",
         prompt_token_ids=list(request.all_token_ids),
         sampling_params=request.sampling_params,
         pooling_params=None,
         cache_salt=request.cache_salt,
-        cache_salt_segments=[(0, "v1"), (32, "v2")],
+        cache_salt_segments=[(0, "v1"), (32, "r@v2")],
         block_hasher=get_request_block_hasher(4, sha256),
     )
     assert fresh.block_hashes == request.block_hashes
     engine.run()
     engine.close()
-    assert engine.segments["r"] == [(0, "v2"), (32, None)]
+    assert engine.segments["r"] == [(0, "r@v2"), (32, None)]
 
 
 def test_session_object_of_two_hash_blocks_is_named_by_the_last():
@@ -2058,7 +2078,7 @@ def test_session_turn_reuses_the_offload_tier_across_a_weight_update(
 ):
     engine = _tier_engine(num_chunks=64)
     _run_turn(engine, 1, "first")
-    assert engine.segments["first"] == [(0, "v1"), (32, None)]
+    assert engine.segments["first"] == [(0, "first@v1"), (32, None)]
     assert engine.scheduler.reset_prefix_cache(reset_connector=reset_connector)
     segments = engine.segments["first"] if with_segments else None
     _run_turn(engine, 2, "second", 72, segments=segments)
@@ -2066,7 +2086,7 @@ def test_session_turn_reuses_the_offload_tier_across_a_weight_update(
     reused = with_segments and not reset_connector
     assert engine.num_loads == expected_loads and engine.num_stores > 0
     assert (engine.keys["second"][:2] == engine.keys["first"][:2]) == reused
-    expected = [(0, "v1"), (32, "v2")] if reused else [(0, "v2")]
+    expected = [(0, "first@v1"), (32, "second@v2")] if reused else [(0, "second@v2")]
     assert engine.segments["second"] == [*expected, (64, None)]
 
 
@@ -2076,8 +2096,8 @@ def test_session_turn_names_the_block_eagle_computes_again_by_its_version():
     _run_turn(engine, 1, "first", 40, 9)
     _run_turn(engine, 2, "second", 72, segments=engine.segments["first"])
     engine.close()
-    assert engine.segments["first"] == [(0, "v1"), (48, None)]
-    assert engine.segments["second"] == [(0, "v1"), (32, "v2"), (64, None)]
+    assert engine.segments["first"] == [(0, "first@v1"), (48, None)]
+    assert engine.segments["second"] == [(0, "first@v1"), (32, "second@v2"), (64, None)]
 
 
 def test_session_turn_with_prompt_logprobs_names_its_prompt_by_its_version():
@@ -2086,13 +2106,13 @@ def test_session_turn_with_prompt_logprobs_names_its_prompt_by_its_version():
     segments = engine.segments["first"]
     _run_turn(engine, 2, "second", 72, segments=segments, prompt_logprobs=1)
     engine.close()
-    assert engine.segments["second"] == [(0, "v2"), (64, None)]
+    assert engine.segments["second"] == [(0, "second@v2"), (64, None)]
 
 
 def test_session_request_loading_kv_across_a_weight_update_names_it_by_the_new():
     engine = _tier_engine(num_chunks=64, hash_block_size=4)
     _run_turn(engine, 1, "first", 24, hash_block_size=4)
-    assert engine.segments["first"] == [(0, "v1"), (16, None)]
+    assert engine.segments["first"] == [(0, "first@v1"), (16, None)]
     assert engine.scheduler.reset_prefix_cache()
     (request,) = _session_requests(
         ["second"], 64, 1, segments=engine.segments["first"], hash_block_size=4
@@ -2104,7 +2124,7 @@ def test_session_request_loading_kv_across_a_weight_update_names_it_by_the_new()
     engine.run()
     engine.close()
     assert engine.num_loads == 1
-    assert engine.segments["second"] == [(0, "v1"), (16, "v2"), (64, None)]
+    assert engine.segments["second"] == [(0, "first@v1"), (16, "second@v2"), (64, None)]
 
 
 @pytest.mark.parametrize("with_segments", [True, False], ids=["segments", "none"])
@@ -2120,8 +2140,9 @@ def test_session_turn_reuses_a_hash_keyed_store_of_another_replica(with_segments
     for engine in reversed(engines):
         _run_turn(engine, 2, "second", 72, segments=segments)
     for engine in engines:
-        engine.close()
+        engine.close(check_leaks=False)
     first, second = engines
+    assert store[0].objects.keys() <= first.listed() | second.listed()
     assert second.num_loads > 0 if with_segments else second.num_loads == 0
     assert second.keys["second"] == first.keys["second"]
     assert second.segments["second"] == first.segments["second"]
@@ -2131,13 +2152,12 @@ def test_session_turn_reuses_a_hash_keyed_store_of_another_replica(with_segments
 @pytest.mark.parametrize(
     "segments,num_tokens,expected",
     [
-        (None, 40, [(0, "v2")]),
-        ([(0, "v1"), (32, None)], 40, [(0, "v1"), (32, "v2")]),
-        ([(0, "v1"), (40, None)], 72, [(0, "v1"), (32, "v2")]),
-        ([(0, "v1"), (64, None)], 40, [(0, "v1"), (32, "v2")]),
-        ([(0, "v1"), (32, None)], 32, [(0, "v1"), (16, "v2")]),
-        ([(0, "v1"), (16, "v2"), (48, None)], 72, [(0, "v1"), (16, "v2")]),
-        ([(0, "v1"), (16, "v3"), (48, None)], 72, [(0, "v1"), (16, "v3"), (48, "v2")]),
+        (None, 40, [(0, "r@v2")]),
+        ([(0, "a"), (32, None)], 40, [(0, "a"), (32, "r@v2")]),
+        ([(0, "a"), (40, None)], 72, [(0, "a"), (32, "r@v2")]),
+        ([(0, "a"), (64, None)], 40, [(0, "a"), (32, "r@v2")]),
+        ([(0, "a"), (32, None)], 32, [(0, "a"), (16, "r@v2")]),
+        ([(0, "a"), (16, "b"), (48, None)], 72, [(0, "a"), (16, "b"), (48, "r@v2")]),
     ],
     ids=[
         "none",
@@ -2145,11 +2165,10 @@ def test_session_turn_reuses_a_hash_keyed_store_of_another_replica(with_segments
         "rounded-down",
         "clipped-to-prompt",
         "covered-to-the-prompt-end",
-        "same-version",
-        "other-version",
+        "two-segments",
     ],
 )
-def test_session_request_salts_its_segments_then_the_current_version(
+def test_session_request_salts_its_segments_then_its_own(
     segments, num_tokens, expected
 ):
     engine = _tier_engine()
@@ -2172,12 +2191,12 @@ def test_session_request_salts_its_segments_then_the_current_version(
 @pytest.mark.parametrize(
     "num_tokens,num_steps,preempt,later_versions,expected",
     [
-        (40, 0, False, (), [(0, "v2"), (48, None)]),
-        (40, 2, False, (), [(0, "v1"), (41, "v2"), (48, None)]),
-        (47, 1, False, (), [(0, "v1"), (47, "v2"), (48, None)]),
-        (40, 2, True, (), [(0, "v1"), (32, "v2"), (48, None)]),
-        (40, 2, True, (3,), [(0, "v1"), (32, "v3"), (48, None)]),
-        (40, 2, True, (1,), [(0, "v1"), (48, None)]),
+        (40, 0, False, (), [(0, "r@v2"), (48, None)]),
+        (40, 2, False, (), [(0, "r@v1"), (41, "r@v2"), (48, None)]),
+        (47, 1, False, (), [(0, "r@v1"), (47, "r@v2"), (48, None)]),
+        (40, 2, True, (), [(0, "r@v1"), (32, "r@v2"), (48, None)]),
+        (40, 2, True, (3,), [(0, "r@v1"), (32, "r@v3"), (48, None)]),
+        (40, 2, True, (1,), [(0, "r@v1"), (48, None)]),
     ],
     ids=[
         "waiting",
