@@ -934,6 +934,11 @@ class AsyncLLM(EngineClient):
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
                             )
+                        if processed_outputs.unreturned_aux_keys:
+                            await engine_core.call_utility_async(
+                                "release_unreturned_aux_outputs",
+                                processed_outputs.unreturned_aux_keys,
+                            )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 

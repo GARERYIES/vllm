@@ -356,6 +356,10 @@ class LLMEngine:
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
             self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+            if processed_outputs.unreturned_aux_keys:
+                self.engine_core.release_unreturned_aux_outputs(
+                    processed_outputs.unreturned_aux_keys
+                )
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):

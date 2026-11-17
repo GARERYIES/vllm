@@ -238,6 +238,9 @@ class EngineCoreClient(ABC):
     def set_weight_version(self, weight_version: str) -> None:
         raise NotImplementedError
 
+    def release_unreturned_aux_outputs(self, keys: dict[str, list[str]]) -> None:
+        raise NotImplementedError
+
     def get_weight_version(self) -> str:
         raise NotImplementedError
 
@@ -494,6 +497,9 @@ class InprocClient(EngineCoreClient):
 
     def set_weight_version(self, weight_version: str) -> None:
         self.engine_core.set_weight_version(weight_version)
+
+    def release_unreturned_aux_outputs(self, keys: dict[str, list[str]]) -> None:
+        self.engine_core.release_unreturned_aux_outputs(keys)
 
     def get_weight_version(self) -> str:
         return self.engine_core.get_weight_version()
@@ -1162,6 +1168,9 @@ class SyncMPClient(MPClient):
 
     def set_weight_version(self, weight_version: str) -> None:
         self.call_utility("set_weight_version", weight_version)
+
+    def release_unreturned_aux_outputs(self, keys: dict[str, list[str]]) -> None:
+        self.call_utility("release_unreturned_aux_outputs", keys)
 
     def get_weight_version(self) -> str:
         return self.call_utility("get_weight_version")
