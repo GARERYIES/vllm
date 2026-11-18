@@ -588,8 +588,13 @@ class AuxOutputSchedulerConnector:
             for end, block_hash in self._written_ends.get(request.request_id, ())
             if end <= boundary
         ]
-        start = max(boundary, state.floor)
-        if start < token_end:
+        start = max(
+            boundary, state.floor, self._computed_from.get(request.request_id, 0)
+        )
+        # An aborted request's in-flight steps may already have moved the
+        # worker's rows past `boundary` into objects it does not list, so it
+        # returns no tail and its products end at its last listed object.
+        if start < token_end and not aborted:
             block_hashes = request.block_hashes
             parent = block_hashes[boundary // hash_size - 1] if boundary else None
             extra_keys, _ = generate_block_hash_extra_keys(
@@ -604,7 +609,8 @@ class AuxOutputSchedulerConnector:
             key = aux_tail_key(self._key_prefix, state.session, tail_hash.hex())
             self._session_tails[request.request_id] = (key, start, token_end)
             keys.append(key)
-        token_end = max(token_end, 0)
+        else:
+            token_end = max(boundary, min(token_end, state.floor))
         segments: list[tuple[int, str | None]] = [
             segment
             for segment in request.cache_salt_segments
