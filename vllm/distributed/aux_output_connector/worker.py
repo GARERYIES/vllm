@@ -92,6 +92,8 @@ class _WorkerRequestState:
     scheduled_cursor: int = 0
     emit_cursor: int = 0
     pending_outputs: int = 0
+    # Positions below it are not written (aux_held / the written frontier).
+    write_from: int = 0
     # Terminal event received; teardown waits for in-flight step outputs.
     finished: bool = False
 
@@ -785,6 +787,9 @@ class AuxOutputWorkerConnector:
                 state.session = metadata.sessions.get(request_id, state.session)
                 state.hash_start = metadata.session_hash_starts.get(
                     request_id, state.hash_start
+                )
+                state.write_from = metadata.session_write_from.get(
+                    request_id, state.write_from
                 )
                 if state.pending_outputs == 0:
                     # In-flight steps leave the worker cursor behind the

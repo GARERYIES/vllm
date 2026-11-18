@@ -457,6 +457,11 @@ class SamplingParams(
     aux_version_segments: list[tuple[int, str | None]] | None = None
     """`aux_version_segments` of the session's previous response: the weight
     versions of the prompt positions it covers."""
+    aux_held: int | None = None
+    """Number of leading positions whose products the client already holds:
+    the longest common prefix of the prompt and the tokens of its plan. The
+    engine writes no position below it, and the response lists the objects of
+    the positions from it on."""
     trace_decode_token_ids: list[int] | None = None
     """If provided, forces the engine to emit this predetermined sequence of
     token IDs during decoding instead of sampling randomly. Real logprobs are
