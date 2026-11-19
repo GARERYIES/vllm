@@ -1,0 +1,31 @@
+diff --git a/tests/kernels/fla/test_fused_recurrent_packed_decode.py b/tests/kernels/fla/test_fused_recurrent_packed_decode.py
+index e43734a..dc6e4f3 100644
+--- a/tests/kernels/fla/test_fused_recurrent_packed_decode.py
++++ b/tests/kernels/fla/test_fused_recurrent_packed_decode.py
+@@ -26,6 +26,7 @@ pytestmark = pytest.mark.skipif(
+         (32, 4, 8, torch.bfloat16, torch.bfloat16),
+         (32, 4, 8, torch.float32, torch.float32),
+         (1, 16, 64, torch.bfloat16, torch.float32),
++        (1, 8, 24, torch.bfloat16, torch.float32),
+         (9, 4, 12, torch.bfloat16, torch.float32),
+         (1, 4, 12, torch.bfloat16, torch.bfloat16),
+     ],
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+index 7de8e40..97e7170 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_recurrent.py
+@@ -460,6 +460,14 @@ def fused_recurrent_gated_delta_rule_packed_decode(
+         # Tuned on H200: with an FP32 state BV=4 is fastest at every measured shape.
+         # No BF16-state tile wins everywhere on SM90, so BF16 keeps 32.
+         BV = 4
++    elif (
++        K == V == 128
++        and initial_state.dtype == torch.float32
++        and current_platform.is_cuda()
++        and current_platform.is_device_capability(80, device_id=dev.index)
++    ):
++        # Tuned on A100 for FP32 state. BF16 keeps the default tile.
++        BV = 8
+     num_stages = 3
+     num_warps = 1
+ 
